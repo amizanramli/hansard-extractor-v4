@@ -8,12 +8,13 @@ matches, then export a structured transcript to Excel.
 """
 from __future__ import annotations
 
+import os
 from datetime import date, datetime
 
 import pandas as pd
 import streamlit as st
 
-from hansard_lib import exporter, matching, parser
+from hansard_lib import exporter, llm_assist, matching, parser
 from hansard_lib.matching import CabinetSnapshot
 
 MAX_PDFS = 5
@@ -192,6 +193,99 @@ if not st.session_state.processed or any(k not in st.session_state for k in _req
 all_turns = st.session_state.all_turns
 pdf_sitting_dates = st.session_state.pdf_sitting_dates
 snapshots = st.session_state.snapshots
+
+# --------------------------------------------------------------------------- #
+# Step 4b — AI-assisted speaker split (optional, DeepSeek)
+# --------------------------------------------------------------------------- #
+st.header("4b. AI-Assisted Speaker Split (optional)")
+st.caption(
+    "A handful of quick interjections are embedded in another speaker's "
+    "block with no honorific the regex parser can key off — e.g. anonymous "
+    "“Seorang Ahli:” / “Beberapa Ahli:” remarks — and stay merged into the "
+    "wrong speaker's Speech Text. Optionally ask an LLM (DeepSeek) to find "
+    "and propose a split for these. Nothing changes until you review and "
+    "accept a proposal below."
+)
+
+st.session_state.setdefault("deepseek_api_key", os.environ.get("DEEPSEEK_API_KEY", ""))
+deepseek_api_key = st.text_input(
+    "DeepSeek API key",
+    type="password",
+    key="deepseek_api_key",
+    help=(
+        "Get a key at platform.deepseek.com. Kept only for this session and "
+        "never written to disk. Speech text for flagged turns only is sent "
+        "to DeepSeek's API for analysis."
+    ),
+)
+
+llm_candidates = llm_assist.find_candidate_turns(all_turns)
+if not llm_candidates:
+    st.caption("Pre-scan found no turns with a leftover bracket-less speaker-tag line.")
+else:
+    st.caption(
+        f"Pre-scan flagged {len(llm_candidates)} turn(s) with a leftover "
+        f"bracket-less speaker-tag line for DeepSeek to check."
+    )
+    if st.button(
+        "Scan flagged turns with DeepSeek", disabled=not deepseek_api_key, key="run_llm_scan"
+    ):
+        progress = st.progress(0.0)
+        scan_proposals: dict[tuple[str, int], list[dict]] = {}
+        scan_errors: dict[tuple[str, int], str] = {}
+        for i, t in enumerate(llm_candidates, start=1):
+            try:
+                segments = llm_assist.call_deepseek(t, deepseek_api_key)
+                is_real_split = len(segments) > 1 or (
+                    len(segments) == 1 and segments[0].get("speaker")
+                )
+                if is_real_split:
+                    scan_proposals[llm_assist.turn_key(t)] = segments
+            except llm_assist.LLMError as e:
+                scan_errors[llm_assist.turn_key(t)] = str(e)
+            progress.progress(i / len(llm_candidates))
+        progress.empty()
+        st.session_state.llm_proposals = scan_proposals
+        st.session_state.llm_errors = scan_errors
+
+llm_proposals = st.session_state.get("llm_proposals", {})
+llm_errors = st.session_state.get("llm_errors", {})
+
+if llm_errors:
+    st.warning(f"{len(llm_errors)} turn(s) could not be checked (left unchanged) — see details below.")
+    with st.expander("DeepSeek errors"):
+        for key, msg in llm_errors.items():
+            st.caption(f"{key}: {msg}")
+
+if llm_proposals:
+    turns_by_key = {llm_assist.turn_key(t): t for t in all_turns}
+    st.write(f"DeepSeek proposed a split for {len(llm_proposals)} turn(s) — review and accept below:")
+    accepted_keys = set()
+    for key, segments in llm_proposals.items():
+        t = turns_by_key.get(key)
+        if t is None:
+            continue
+        with st.expander(f"{t.pdf_label} · turn {t.order} · {t.speaker_raw} (p.{t.page_start})"):
+            st.text_area("Original", t.speech_text, height=120, disabled=True, key=f"llm_orig_{key}")
+            for i, seg in enumerate(segments, start=1):
+                label = seg.get("speaker") or t.speaker_raw
+                st.markdown(f"**{i}. {label}**")
+                st.text(seg.get("text", ""))
+            if st.checkbox("Apply this split", value=True, key=f"llm_apply_{key}"):
+                accepted_keys.add(key)
+    if st.button("Apply accepted splits", type="primary", key="apply_llm_splits"):
+        all_turns = llm_assist.apply_splits(all_turns, llm_proposals, accepted_keys)
+        st.session_state.all_turns = all_turns
+        st.session_state.unique_speakers_df = matching.build_unique_speakers_table(all_turns)
+        stale_prefixes = (
+            "llm_orig_", "llm_apply_", "speaker_merge_editor", "const_editor",
+            "role_editor", "transcript_editor_",
+        )
+        for ek in list(st.session_state.keys()):
+            if ek in ("llm_proposals", "llm_errors") or ek.startswith(stale_prefixes):
+                st.session_state.pop(ek, None)
+        st.success("Splits applied — tables below now reflect the change.")
+        st.rerun()
 
 # --------------------------------------------------------------------------- #
 # Step 5 — Speaker consolidation (merge duplicate variants)

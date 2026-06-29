@@ -26,6 +26,7 @@ streamlit run app.py
    in force on each PDF's sitting date when matching ministers to their
    portfolio.
 4. **Process** — click to parse all PDFs and run the auto-matching.
+4b. **AI-Assisted Speaker Split (optional)** — see below.
 5. **Review & Edit Matches** — two editable tables, one row per unique
    speaker: constituency matches and Cabinet role/ministry matches. Fix any
    wrong auto-matches here (e.g. after a by-election, or a name the fuzzy
@@ -51,6 +52,25 @@ streamlit run app.py
   is cross-checked against the roster (constrained to that constituency) —
   the roster is not allowed to silently swap in a different person's name
   (useful since a roster may have since been updated after a by-election).
+
+## Optional: AI-assisted speaker split (DeepSeek)
+
+The regex parser can only safely split a bracket-less `Name: text` reply
+into its own turn when the name part has a tell-tale honorific/`bin`/`binti`
+token (see `bracket_is_name()` in `hansard_lib/parser.py`) — anonymous
+interjection tags like `Seorang Ahli:` ("an unnamed Member") or
+`Beberapa Ahli:` ("several Members") have no such token and are
+deliberately left merged into the surrounding speaker's Speech Text, since
+a plain regex can't reliably tell those apart from an ordinary sentence
+that happens to contain a colon.
+
+Step 4b optionally hands just those leftover, still-ambiguous turns to an
+LLM (DeepSeek, via its Chat Completions API) to make that call instead. You
+provide your own DeepSeek API key (get one at platform.deepseek.com) in a
+password-masked field — it's kept only for the browser session and never
+written to disk. Only the Speech Text of turns flagged by a quick local
+pre-scan is sent to DeepSeek's API; every proposed split is shown for you
+to accept or reject before anything is changed.
 
 ## Known limitations
 
