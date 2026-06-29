@@ -24,12 +24,20 @@ from .parser import Turn
 
 HONORIFICS = {
     "YB", "TUAN", "PUAN", "DATO", "DATUK", "SERI", "SRI", "HAJI", "HAJJAH",
-    "HJ", "HJH", "DR", "PROF", "PROFESSOR", "TAN", "TUN", "TENGKU", "RAJA",
+    "HJ", "HJH", "DR", "PROF", "PROFESSOR", "TUN",
     "ENCIK", "CIK", "IR", "TS", "SENATOR", "PANGLIMA", "WIRA", "AMAR",
     "USTAZ", "USTAZAH", "MEJEN", "JEN", "KOL", "LT", "BRIG", "ARM", "ADM",
-    "PUTERA", "PUTERI", "MEGAT", "SYED", "SYARIFAH", "NIK", "WAN", "AWANG",
-    "ABANG", "DAYANG", "PEHIN", "BENTARA", "ORANG", "KAYA", "PM",
+    "ABANG", "PEHIN", "BENTARA", "ORANG", "KAYA", "PM",
 }
+# Words that are *usually* honorifics but, in this roster, also turn up as
+# real given-name/surname components (e.g. "Wan Ahmad Fayhsal", "Syed Saddiq",
+# "Nik Nazmi", "Awang bin Hashim", "Tan Kok Wai" the Chinese surname).
+# Stripping them unconditionally loses identifying signal and causes false
+# collisions between different people (e.g. "Awang bin Hashim" collapsing to
+# just "HASHIM"), so they're deliberately left out of HONORIFICS. "TAN" only
+# functions as a pure title in the two-word phrase "Tan Sri", which is
+# stripped explicitly below before tokenization.
+_AMBIGUOUS_TITLE_PHRASES = [r"\bTAN\s+SRI\b"]
 CONNECTORS = {"BIN", "BINTI", "A/L", "A/P"}
 
 
@@ -43,6 +51,8 @@ def normalize_name(name: Optional[str]) -> str:
     s = s.replace("-", " ")
     s = s.replace("'", "")
     s = re.sub(r"\bA/L\b|\bA/P\b", " ", s)
+    for phrase in _AMBIGUOUS_TITLE_PHRASES:
+        s = re.sub(phrase, " ", s)
     tokens = [t.strip("'") for t in s.split() if t.strip("'")]
     out = [t for t in tokens if t not in HONORIFICS and t not in CONNECTORS]
     return " ".join(out)
@@ -132,14 +142,9 @@ def guess_column(columns: list[str], keywords: list[str]) -> Optional[str]:
     return None
 
 
-def build_constituency_directory(
-    turns: list[Turn],
-    roster_df: Optional[pd.DataFrame],
-    name_col: Optional[str],
-    const_col: Optional[str],
-) -> pd.DataFrame:
-    """One row per unique speaker (by normalized name) with an auto-matched
-    constituency, ready for manual review/editing."""
+def collect_speaker_occurrences(turns: list[Turn]) -> dict[str, dict]:
+    """Groups non-CHAIR turns by normalize_name(speaker_raw). Shared by the
+    speaker-consolidation table below and build_constituency_directory."""
     by_key: dict[str, dict] = {}
     for t in turns:
         if t.kind == "CHAIR":
@@ -159,6 +164,146 @@ def build_constituency_directory(
         # least truncated by line-wrapping).
         if len(raw) > len(entry["speaker_raw"]):
             entry["speaker_raw"] = raw
+    return by_key
+
+
+def apply_merge_map(
+    by_key: dict[str, dict], merge_map: Optional[dict[str, str]]
+) -> dict[str, dict]:
+    """Re-keys a collect_speaker_occurrences() result using a user-confirmed
+    merge_map (raw normalized key -> canonical normalized key) from the
+    Speaker Consolidation UI, combining occurrences/constituency/
+    representative text across merged variants."""
+    if not merge_map:
+        return by_key
+    merged: dict[str, dict] = {}
+    for key, entry in by_key.items():
+        canon = merge_map.get(key, key)
+        m = merged.setdefault(
+            canon,
+            {"speaker_key": canon, "speaker_raw": entry["speaker_raw"], "constituency_raw": "", "occurrences": 0},
+        )
+        m["occurrences"] += entry["occurrences"]
+        if not m["constituency_raw"] and entry["constituency_raw"]:
+            m["constituency_raw"] = entry["constituency_raw"]
+        if len(entry["speaker_raw"]) > len(m["speaker_raw"]):
+            m["speaker_raw"] = entry["speaker_raw"]
+    return merged
+
+
+def _self_similarity_score(a: str, b: str) -> float:
+    """Similarity between two already-normalized speaker keys. Word order
+    rarely differs between OCR/typo variants of the same person's name (that's
+    what token_sort_ratio is for), but merged/dropped letters and a dropped or
+    added nickname token do - e.g. "AHMAD ZAHID HAMIDI" vs "AHMAD ZAHIDHAMIDI"
+    scores only ~69 on token_sort_ratio (token boundaries shifted) but ~97 on
+    a plain character ratio; "MOKTAR RADIN" vs "BUNG MOKTAR RADIN" scores ~83
+    on ratio/token_sort but 100 on token_set_ratio (handles inserted tokens).
+    Taking the max of these three catches all of the above. Deliberately NOT
+    using partial_ratio here - it scores a shared surname as near-perfect even
+    when the rest of the name is completely different (e.g. two unrelated
+    people who are both "... bin Mohd Nor" scored 88, exactly at cutoff),
+    which produces false-positive merge suggestions between different real
+    people."""
+    if _HAVE_RAPIDFUZZ:
+        return max(
+            fuzz.token_sort_ratio(a, b),
+            fuzz.ratio(a, b),
+            fuzz.token_set_ratio(a, b),
+        )
+    return difflib.SequenceMatcher(None, a, b).ratio() * 100
+
+
+def suggest_duplicate_targets(
+    keys: list[str], occurrences: dict[str, int], score_cutoff: float = 88
+) -> dict[str, str]:
+    """Flags likely-duplicate speaker variants by comparing each normalized
+    key against every other one - catches truncated/typo'd/honorific-
+    inconsistent variants normalize_name() alone didn't already merge.
+    Always suggests merging the less-frequent variant into the more-
+    frequent one, never the reverse. This is only a starting suggestion -
+    the user confirms/corrects it in the UI before it's applied to anything."""
+    suggestions: dict[str, str] = {}
+    for k in keys:
+        best_candidate, best_score = None, 0.0
+        for c in keys:
+            if c == k:
+                continue
+            score = _self_similarity_score(k, c)
+            if score > best_score:
+                best_candidate, best_score = c, score
+        if best_candidate is None or best_score < score_cutoff:
+            continue
+        if occurrences.get(best_candidate, 0) > occurrences.get(k, 0):
+            suggestions[k] = best_candidate
+    return suggestions
+
+
+def build_unique_speakers_table(turns: list[Turn], score_cutoff: float = 88) -> pd.DataFrame:
+    """One row per unique speaker (pre-consolidation), with a suggested
+    duplicate target where the fuzzy matcher finds a likely match among the
+    *other* speakers - feeds the "Speaker Consolidation" review UI."""
+    by_key = collect_speaker_occurrences(turns)
+    keys = list(by_key.keys())
+    occurrences = {k: by_key[k]["occurrences"] for k in keys}
+    printed = {k: by_key[k]["speaker_raw"] for k in keys}
+    suggestions = suggest_duplicate_targets(keys, occurrences, score_cutoff=score_cutoff)
+
+    rows = []
+    for k in sorted(keys, key=lambda kk: -occurrences[kk]):
+        sugg = suggestions.get(k)
+        rows.append(
+            {
+                "Speaker (As Printed)": printed[k],
+                "Occurrences": occurrences[k],
+                "Merge Into": printed[sugg] if sugg else "(keep separate)",
+                "Auto-Suggested": "Yes" if sugg else "",
+                "_speaker_key": k,
+            }
+        )
+    return pd.DataFrame(rows)
+
+
+def resolve_merge_map(edited_speakers: pd.DataFrame) -> dict[str, str]:
+    """Turns the user-edited "Merge Into" column (printed-name selections)
+    into a normalized-key -> canonical-normalized-key map, following chains
+    (A merges into B, B merges into C => A and B both resolve to C)."""
+    if edited_speakers is None or edited_speakers.empty:
+        return {}
+    printed_to_key = {
+        row["Speaker (As Printed)"]: row["_speaker_key"] for _, row in edited_speakers.iterrows()
+    }
+    target_key: dict[str, str] = {}
+    for _, row in edited_speakers.iterrows():
+        k = row["_speaker_key"]
+        target_label = row.get("Merge Into") or "(keep separate)"
+        if target_label != "(keep separate)" and target_label in printed_to_key:
+            t = printed_to_key[target_label]
+            if t != k:
+                target_key[k] = t
+
+    resolved: dict[str, str] = {}
+    for k in printed_to_key.values():
+        seen = set()
+        cur = k
+        while cur in target_key and cur not in seen:
+            seen.add(cur)
+            cur = target_key[cur]
+        resolved[k] = cur
+    return resolved
+
+
+def build_constituency_directory(
+    turns: list[Turn],
+    roster_df: Optional[pd.DataFrame],
+    name_col: Optional[str],
+    const_col: Optional[str],
+    merge_map: Optional[dict[str, str]] = None,
+) -> pd.DataFrame:
+    """One row per unique speaker (by normalized name, after applying any
+    user-confirmed speaker-consolidation merges) with an auto-matched
+    constituency, ready for manual review/editing."""
+    by_key = apply_merge_map(collect_speaker_occurrences(turns), merge_map)
 
     rows = []
     roster_names = roster_df[name_col].tolist() if (roster_df is not None and name_col) else []
@@ -219,8 +364,10 @@ def build_role_directory(
     turns: list[Turn],
     snapshots: list[CabinetSnapshot],
     pdf_sitting_dates: dict[str, Optional[date]],
+    merge_map: Optional[dict[str, str]] = None,
 ) -> pd.DataFrame:
-    """One row per (speaker, cabinet snapshot actually used) combination."""
+    """One row per (speaker, cabinet snapshot actually used) combination,
+    after applying any user-confirmed speaker-consolidation merges."""
     if not snapshots:
         return pd.DataFrame(
             columns=[
@@ -240,6 +387,8 @@ def build_role_directory(
         key = normalize_name(raw)
         if not key:
             continue
+        if merge_map:
+            key = merge_map.get(key, key)
         dk = (key, snap.label)
         entry = by_key.setdefault(
             dk, {"speaker_key": key, "speaker_raw": raw, "snapshot": snap, "occurrences": 0}
@@ -287,9 +436,12 @@ def assemble_transcript(
     role_dir: pd.DataFrame,
     pdf_sitting_dates: dict[str, Optional[date]],
     snapshots: list[CabinetSnapshot],
+    merge_map: Optional[dict[str, str]] = None,
 ) -> pd.DataFrame:
     """Joins the (possibly user-edited) speaker directories back onto every
-    individual turn to produce the final exportable transcript."""
+    individual turn to produce the final exportable transcript. merge_map
+    must be the same one used to build constituency_dir/role_dir, so each
+    turn resolves to the same canonical speaker key those directories used."""
     const_lookup = {}
     if constituency_dir is not None and not constituency_dir.empty:
         for _, r in constituency_dir.iterrows():
@@ -303,6 +455,8 @@ def assemble_transcript(
     rows = []
     for t in turns:
         key = normalize_name(t.speaker_raw)
+        if merge_map:
+            key = merge_map.get(key, key)
         crow = const_lookup.get(key)
         snap = choose_snapshot_for_date(snapshots, pdf_sitting_dates.get(t.pdf_label)) if t.kind != "CHAIR" else None
         rrow = role_lookup.get((key, snap.label)) if snap is not None else None

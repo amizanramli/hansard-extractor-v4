@@ -169,17 +169,11 @@ if st.button("Process Hansard(s)", type="primary", disabled=not pdf_entries):
         all_turns.extend(e["turns"])
     pdf_sitting_dates = {e["label"]: e["sitting_date"] for e in pdf_entries}
 
-    constituency_dir = matching.build_constituency_directory(
-        all_turns, roster_df, roster_name_col, roster_const_col
-    )
-    role_dir = matching.build_role_directory(all_turns, snapshots, pdf_sitting_dates)
-
     st.session_state.processed = True
     st.session_state.all_turns = all_turns
     st.session_state.pdf_sitting_dates = pdf_sitting_dates
-    st.session_state.constituency_dir = constituency_dir
-    st.session_state.role_dir = role_dir
     st.session_state.snapshots = snapshots
+    st.session_state.unique_speakers_df = matching.build_unique_speakers_table(all_turns)
     st.session_state.pdf_entries_meta = [
         {"label": e["label"], "sitting_date": e["sitting_date"], "pages": len(e["pages_text"]), "turns": len(e["turns"])}
         for e in pdf_entries
@@ -193,12 +187,56 @@ pdf_sitting_dates = st.session_state.pdf_sitting_dates
 snapshots = st.session_state.snapshots
 
 # --------------------------------------------------------------------------- #
-# Step 5 — Review & edit matches
+# Step 5 — Speaker consolidation (merge duplicate variants)
 # --------------------------------------------------------------------------- #
-st.header("5. Review & Edit Matches")
+st.header("5. Speaker Consolidation")
+st.caption(
+    "The same person printed two different ways (honorific inconsistencies, "
+    "OCR quirks, a line-wrap truncation, etc.) shows up below as separate "
+    "rows. Set “Merge Into” to collapse a variant into its canonical "
+    "speaker — likely duplicates are pre-suggested, but always review them."
+)
+
+unique_speakers_df = st.session_state.unique_speakers_df
+if unique_speakers_df.empty:
+    st.caption("No speakers detected yet.")
+    merge_map = {}
+else:
+    merge_options = ["(keep separate)"] + sorted(unique_speakers_df["Speaker (As Printed)"].unique().tolist())
+    edited_speakers = st.data_editor(
+        unique_speakers_df,
+        key="speaker_merge_editor",
+        width="stretch",
+        num_rows="fixed",
+        column_order=["Speaker (As Printed)", "Occurrences", "Merge Into", "Auto-Suggested"],
+        disabled=["Speaker (As Printed)", "Occurrences", "Auto-Suggested"],
+        column_config={
+            "Merge Into": st.column_config.SelectboxColumn(
+                "Merge Into", options=merge_options, required=True,
+            ),
+        },
+        height=min(36 * (len(unique_speakers_df) + 1) + 4, 480),
+    )
+    merge_map = matching.resolve_merge_map(edited_speakers)
+    n_before = len(unique_speakers_df)
+    n_after = len(set(merge_map.values())) if merge_map else n_before
+    if n_after < n_before:
+        st.success(f"{n_before} speaker variants → {n_after} unique speakers after consolidation.")
+    else:
+        st.caption(f"{n_before} unique speakers — no duplicates merged yet.")
+
+# --------------------------------------------------------------------------- #
+# Step 6 — Review & edit matches
+# --------------------------------------------------------------------------- #
+st.header("6. Review & Edit Matches")
+
+constituency_dir = matching.build_constituency_directory(
+    all_turns, roster_df, roster_name_col, roster_const_col, merge_map=merge_map
+)
+role_dir = matching.build_role_directory(all_turns, snapshots, pdf_sitting_dates, merge_map=merge_map)
 
 st.subheader("Speakers & Constituencies")
-const_df = st.session_state.constituency_dir
+const_df = constituency_dir
 if const_df.empty:
     st.caption("No speakers detected, or no roster uploaded.")
     edited_const = const_df
@@ -214,7 +252,7 @@ else:
     )
 
 st.subheader("Cabinet Roles")
-role_df = st.session_state.role_dir
+role_df = role_dir
 if role_df.empty:
     st.caption("No ministers detected, or no cabinet file uploaded.")
     edited_role = role_df
@@ -230,13 +268,13 @@ else:
     )
 
 transcript_df = matching.assemble_transcript(
-    all_turns, edited_const, edited_role, pdf_sitting_dates, snapshots
+    all_turns, edited_const, edited_role, pdf_sitting_dates, snapshots, merge_map=merge_map
 )
 
 # --------------------------------------------------------------------------- #
-# Step 6 — Final transcript preview (per PDF, editable)
+# Step 7 — Final transcript preview (per PDF, editable)
 # --------------------------------------------------------------------------- #
-st.header("6. Transcript Preview")
+st.header("7. Transcript Preview")
 
 pdf_labels = list(transcript_df["PDF Source"].unique())
 final_frames = {}
@@ -260,9 +298,9 @@ for tab, label in zip(tabs, pdf_labels):
 final_transcript_df = pd.concat(final_frames.values(), ignore_index=True) if final_frames else transcript_df
 
 # --------------------------------------------------------------------------- #
-# Step 7 — Export
+# Step 8 — Export
 # --------------------------------------------------------------------------- #
-st.header("7. Export")
+st.header("8. Export")
 
 metadata_rows = []
 roster_name = roster_file.name if roster_file else "(none)"
@@ -280,13 +318,19 @@ for m in st.session_state.pdf_entries_meta:
         }
     )
 
+pdf_labels_all = [m["label"] for m in st.session_state.pdf_entries_meta]
+if len(pdf_labels_all) == 1:
+    combined_file_name = exporter.matching_xlsx_filename(pdf_labels_all[0])
+else:
+    combined_file_name = "hansard_combined.xlsx"
+
 c1, c2 = st.columns(2)
 with c1:
     combined_bytes = exporter.build_combined_workbook(final_transcript_df, metadata_rows)
     st.download_button(
         "Download combined workbook (.xlsx)",
         data=combined_bytes,
-        file_name="hansard_combined.xlsx",
+        file_name=combined_file_name,
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         width="stretch",
     )

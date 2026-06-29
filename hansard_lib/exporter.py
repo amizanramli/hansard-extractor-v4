@@ -92,13 +92,26 @@ def build_zip_of_individual_workbooks(
     return zip_buf.getvalue()
 
 
+def matching_xlsx_filename(pdf_label: str) -> str:
+    """Public helper: the .xlsx filename that matches a given source PDF's
+    filename, e.g. "DR-19122022.pdf" -> "DR-19122022.xlsx"."""
+    return _safe_filename(pdf_label) + ".xlsx"
+
+
+def _strip_pdf_ext(name: str) -> str:
+    s = str(name)
+    if s.lower().endswith(".pdf"):
+        s = s[: -len(".pdf")]
+    return s
+
+
 def _safe_sheet_name(name: str) -> str:
     bad = set('[]:*?/\\')
-    cleaned = "".join(c for c in str(name) if c not in bad)
+    cleaned = "".join(c for c in _strip_pdf_ext(name) if c not in bad)
     return cleaned[:31] or "Sheet"
 
 
 def _safe_filename(name: str) -> str:
     bad = set('[]:*?/\\<>|"')
-    cleaned = "".join(c for c in str(name) if c not in bad)
+    cleaned = "".join(c for c in _strip_pdf_ext(name) if c not in bad)
     return cleaned.replace(" ", "_") or f"hansard_{datetime.now():%Y%m%d%H%M%S}"

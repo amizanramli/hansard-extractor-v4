@@ -37,6 +37,15 @@ NAME_HINT_RE = re.compile(
 )
 BIN_RE = re.compile(r"\b(BIN|BINTI|A/L|A/P)\b", re.I)
 
+# Repeating page header/footer stamp printed on every page, e.g. "56 DR.19.12.2022",
+# "DR.19.12.2022 iii", "DR. 12.12.2024 44" (the exact layout varies across sittings/
+# years). This is not real speech content and must never leak into a turn's speech
+# text — without this, it shows up mid-sentence in exported cells.
+PAGE_STAMP_RE = re.compile(
+    r"^\s*(?:[ivxlcdm]+|\d+)?\s*DR\.?\s*\d{2}\.\d{2}\.\d{4}\s*(?:[ivxlcdm]+|\d+)?\s*$",
+    re.IGNORECASE,
+)
+
 MALAY_MONTHS = {
     "januari": 1, "februari": 2, "mac": 3, "april": 4, "mei": 5, "jun": 6,
     "julai": 7, "ogos": 8, "september": 9, "oktober": 10, "november": 11,
@@ -125,6 +134,8 @@ def extract_turns(pages_text: list[str], pdf_label: str) -> list[Turn]:
 
     for page_no, raw_line in lines:
         stripped = raw_line.strip()
+        if stripped and PAGE_STAMP_RE.match(stripped):
+            continue  # drop repeating page-header/footer stamp, never part of speech
         hm = HEADER_RE.match(stripped)
         cm = None if hm else CHAIR_RE.match(stripped)
 
