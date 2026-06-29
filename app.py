@@ -13,11 +13,12 @@ from datetime import date, datetime
 
 import pandas as pd
 import streamlit as st
+import streamlit.components.v1 as components
 
 from hansard_lib import exporter, llm_assist, matching, parser
 from hansard_lib.matching import CabinetSnapshot
 
-MAX_PDFS = 5
+MAX_PDFS = 10
 
 # Reference notes only — not used anywhere in the matching logic. Helps when
 # picking a PDF's sitting date (Step 1) or a Cabinet snapshot's "effective
@@ -82,6 +83,107 @@ def _read_excel_with_sheet_picker(uploaded_file, key_prefix: str) -> pd.DataFram
             f"Sheet to use ({uploaded_file.name})", xl.sheet_names, key=f"{key_prefix}_sheet"
         )
     return xl.parse(sheet)
+
+
+def _render_card_view(df: pd.DataFrame) -> None:
+    """Step 7 'Card View' tab: browse one turn at a time with its full
+    metadata, instead of scanning a wide table. Navigable via the
+    Previous/Next buttons, the slider, or (best-effort, since Streamlit has
+    no native global keybinding support) the Left/Right arrow keys."""
+    if df.empty:
+        st.info("No turns to preview.")
+        return
+
+    df = df.reset_index(drop=True)
+    total = len(df)
+    idx = st.session_state.get("card_idx", 0)
+    idx = max(0, min(idx, total - 1))
+
+    nav_l, nav_mid, nav_r = st.columns([1, 3, 1])
+    changed = False
+    with nav_l:
+        if st.button("⬅ Previous", use_container_width=True, disabled=idx == 0, key="card_prev_btn"):
+            idx -= 1
+            changed = True
+    with nav_r:
+        if st.button("Next ➡", use_container_width=True, disabled=idx == total - 1, key="card_next_btn"):
+            idx += 1
+            changed = True
+    idx = max(0, min(idx, total - 1))
+    if changed:
+        # Force the slider to pick up the new idx this run instead of its
+        # own stale widget state (same data_editor-style stale-key gotcha).
+        st.session_state.pop("card_slider", None)
+    with nav_mid:
+        jump = st.slider(
+            "Turn", min_value=1, max_value=total, value=idx + 1,
+            key="card_slider", label_visibility="collapsed",
+        )
+        idx = jump - 1
+
+    st.session_state["card_idx"] = idx
+    row = df.iloc[idx]
+
+    def _val(col: str) -> str:
+        v = row.get(col, "")
+        if v is None or (isinstance(v, float) and pd.isna(v)) or str(v).strip() == "":
+            return "—"
+        return str(v)
+
+    st.caption(f"Turn {idx + 1} of {total} · {_val('PDF Source')} · Sitting date: {_val('Sitting Date')}")
+
+    with st.container(border=True):
+        c1, c2 = st.columns(2)
+        with c1:
+            st.markdown(f"**Speaker (As Printed):** {_val('Speaker (As Printed)')}")
+            st.markdown(f"**Matched Name:** {_val('Matched Name')}")
+            st.markdown(f"**Constituency:** {_val('Constituency')}  ·  *{_val('Constituency Confidence')}*")
+        with c2:
+            st.markdown(f"**Order / Page:** {_val('Order')} / {_val('Page')}")
+            st.markdown(f"**Jawatan:** {_val('Jawatan')}")
+            st.markdown(f"**Kementerian:** {_val('Kementerian')}  ·  *{_val('Role Confidence')}*")
+
+    st.markdown("**Speech Text**")
+    st.text_area(
+        "Speech Text", value=str(row.get("Speech Text", "")), height=320,
+        disabled=True, label_visibility="collapsed", key=f"card_speech_{idx}",
+    )
+
+    # Best-effort Left/Right arrow-key navigation. Streamlit has no native
+    # global keyboard hook, so this reaches into the parent document (same
+    # origin as this component's iframe) and clicks the Previous/Next
+    # buttons by their visible text. It only acts while the "Card View" tab
+    # is the active one, and never while focus is in a text field.
+    components.html(
+        """
+        <script>
+        (function () {
+          const doc = window.parent.document;
+          function isCardViewActive() {
+            const tabs = Array.from(doc.querySelectorAll('button[role="tab"]'));
+            const cardTab = tabs.find((t) => t.innerText.includes('Card View'));
+            return cardTab ? cardTab.getAttribute('aria-selected') === 'true' : false;
+          }
+          function clickButtonByText(text) {
+            const buttons = Array.from(doc.querySelectorAll('button'));
+            const btn = buttons.find((b) => b.innerText.trim() === text);
+            if (btn && !btn.disabled) { btn.click(); }
+          }
+          if (!doc.__hansardCardNavBound) {
+            doc.addEventListener('keydown', function (e) {
+              if (!isCardViewActive()) return;
+              const tag = ((doc.activeElement && doc.activeElement.tagName) || '').toLowerCase();
+              if (['input', 'textarea', 'select'].includes(tag)) return;
+              if (e.key === 'ArrowRight') { clickButtonByText('Next ➡'); }
+              else if (e.key === 'ArrowLeft') { clickButtonByText('⬅ Previous'); }
+            });
+            doc.__hansardCardNavBound = true;
+          }
+        })();
+        </script>
+        """,
+        height=0,
+    )
 
 
 # --------------------------------------------------------------------------- #
@@ -523,8 +625,8 @@ st.header("7. Transcript Preview")
 
 pdf_labels = list(transcript_df["PDF Source"].unique())
 final_frames = {}
-tabs = st.tabs(pdf_labels) if len(pdf_labels) > 1 else [st.container()]
-for tab, label in zip(tabs, pdf_labels):
+tabs = st.tabs(pdf_labels + ["🔎 Card View"])
+for tab, label in zip(tabs[:-1], pdf_labels):
     with tab:
         sub = transcript_df[transcript_df["PDF Source"] == label].reset_index(drop=True)
         edited_sub = st.data_editor(
@@ -541,6 +643,9 @@ for tab, label in zip(tabs, pdf_labels):
         final_frames[label] = edited_sub
 
 final_transcript_df = pd.concat(final_frames.values(), ignore_index=True) if final_frames else transcript_df
+
+with tabs[-1]:
+    _render_card_view(final_transcript_df)
 
 # --------------------------------------------------------------------------- #
 # Step 8 — Export
