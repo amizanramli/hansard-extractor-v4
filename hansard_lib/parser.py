@@ -52,11 +52,14 @@ NAME_HINT_RE = re.compile(
 BIN_RE = re.compile(r"\b(BIN|BINTI|A/L|A/P)\b", re.I)
 
 # Repeating page header/footer stamp printed on every page, e.g. "56 DR.19.12.2022",
-# "DR.19.12.2022 iii", "DR. 12.12.2024 44" (the exact layout varies across sittings/
-# years). This is not real speech content and must never leak into a turn's speech
-# text — without this, it shows up mid-sentence in exported cells.
+# "DR.19.12.2022 iii", "DR. 12.12.2024 44", "DR. 12.6.2023 3" (the exact layout,
+# and whether day/month are zero-padded, varies across sittings/years). This is
+# not real speech content and must never leak into a turn's speech text —
+# without this, it shows up mid-sentence in exported cells. \d{1,2} (not \d{2})
+# is deliberate: an un-padded date like "12.6.2023" (June, not "06") would
+# otherwise fail to match and leak straight into the Speech Text column.
 PAGE_STAMP_RE = re.compile(
-    r"^\s*(?:[ivxlcdm]+|\d+)?\s*DR\.?\s*\d{2}\.\d{2}\.\d{4}\s*(?:[ivxlcdm]+|\d+)?\s*$",
+    r"^\s*(?:[ivxlcdm]+|\d+)?\s*DR\.?\s*\d{1,2}\.\d{1,2}\.\d{4}\s*(?:[ivxlcdm]+|\d+)?\s*$",
     re.IGNORECASE,
 )
 
