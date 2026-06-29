@@ -179,7 +179,14 @@ if st.button("Process Hansard(s)", type="primary", disabled=not pdf_entries):
         for e in pdf_entries
     ]
 
-if not st.session_state.processed:
+_required_keys = ["all_turns", "pdf_sitting_dates", "snapshots", "unique_speakers_df", "pdf_entries_meta"]
+if not st.session_state.processed or any(k not in st.session_state for k in _required_keys):
+    if st.session_state.processed:
+        # processed=True survived from a session started under older app code
+        # that didn't set every key the current code expects — rather than
+        # crashing on a missing key below, ask for a clean re-process.
+        st.session_state.processed = False
+        st.warning("The app was updated — please click “Process Hansard(s)” again.")
     st.stop()
 
 all_turns = st.session_state.all_turns
