@@ -107,12 +107,49 @@ def extract_pages_text(file_bytes: bytes) -> list[str]:
     return pages
 
 
+def _unwrap_split_brackets(lines: list[tuple[int, str]]) -> list[tuple[int, str]]:
+    """A speaker tag's bracketed name is sometimes long enough to wrap onto
+    the next printed line, e.g.:
+
+        Menteri Sumber Asli, Alam Sekitar dan Perubahan Iklim [Tuan Nik Nazmi bin
+        Nik Ahmad]: Terima kasih Tuan Yang di-Pertua...
+
+    HEADER_RE can't see a "[" and its matching "]:" if they're on different
+    lines, so the whole tag — and therefore the turn boundary — is missed,
+    silently merging this speaker's entire turn into whoever spoke before
+    them. Re-join any line with an unmatched "[" with however many following
+    lines it takes to close the bracket (capped, so a stray unmatched "["
+    can't swallow the rest of the page).
+    """
+    merged: list[tuple[int, str]] = []
+    i = 0
+    n = len(lines)
+    while i < n:
+        page_no, text = lines[i]
+        opens, closes = text.count("["), text.count("]")
+        hops = 0
+        while opens > closes and i + 1 < n and hops < 4:
+            i += 1
+            hops += 1
+            _, nxt = lines[i]
+            text = text.rstrip() + " " + nxt.lstrip()
+            opens += nxt.count("[")
+            closes += nxt.count("]")
+        merged.append((page_no, text))
+        i += 1
+    return merged
+
+
 def extract_turns(pages_text: list[str], pdf_label: str) -> list[Turn]:
     """Split a Hansard's page texts into a flat list of speaker turns."""
     lines: list[tuple[int, str]] = []
     for page_no, txt in enumerate(pages_text, start=1):
         for line in txt.split("\n"):
+            stripped = line.strip()
+            if stripped and PAGE_STAMP_RE.match(stripped):
+                continue  # drop repeating page-header/footer stamp
             lines.append((page_no, line))
+    lines = _unwrap_split_brackets(lines)
 
     turns: list[Turn] = []
     current: Optional[dict] = None
@@ -134,8 +171,6 @@ def extract_turns(pages_text: list[str], pdf_label: str) -> list[Turn]:
 
     for page_no, raw_line in lines:
         stripped = raw_line.strip()
-        if stripped and PAGE_STAMP_RE.match(stripped):
-            continue  # drop repeating page-header/footer stamp, never part of speech
         hm = HEADER_RE.match(stripped)
         cm = None if hm else CHAIR_RE.match(stripped)
 
