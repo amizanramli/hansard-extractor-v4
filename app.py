@@ -17,7 +17,7 @@ import streamlit as st
 from hansard_lib import exporter, llm_assist, matching, parser
 from hansard_lib.matching import CabinetSnapshot
 
-MAX_PDFS = 5
+MAX_PDFS = 10
 
 # Reference notes only — not used anywhere in the matching logic. Helps when
 # picking a PDF's sitting date (Step 1) or a Cabinet snapshot's "effective
