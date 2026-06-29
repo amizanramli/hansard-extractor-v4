@@ -27,6 +27,20 @@ import pdfplumber
 HEADER_RE = re.compile(r"^(.*?)\[([^\]\n]{1,90})\]:\s*(.*)$")
 CHAIR_RE = re.compile(r"^(Tuan Yang di-Pertua):\s*(.*)$")
 
+# Quick back-and-forth exchanges (the Chair calling on a minister, a rapid
+# interjection during debate, etc.) are sometimes printed *without* the usual
+# "[bracket]" tag - just "Name: text", reusing whichever name/position was
+# already established earlier. HEADER_RE/CHAIR_RE can't see these (no
+# brackets, and not the Chair's fixed tag), so without this, the line is
+# silently appended to the *previous* speaker's turn instead of starting a
+# new one for the actual person speaking - e.g. a minister's reply ends up
+# inside the asking MP's "Speech Text". Checked against bracket_is_name()
+# below before being trusted as an actual speaker tag (see there for why).
+_NAME_WORD = r"(?:[A-Za-zÀ-ÿ][A-Za-zÀ-ÿ.'’/-]*|@)"
+PLAIN_NAME_RE = re.compile(
+    rf"^({_NAME_WORD}(?:\s+{_NAME_WORD}){{1,7}}):\s+(\S.*)$"
+)
+
 # Tokens that, if present in a "[bracket]" tag, mean the bracket holds a
 # *person's name* rather than a constituency (used for ministers, deputy
 # ministers, parliamentary officers, etc.)
@@ -61,8 +75,9 @@ TEXT_DATE_RE = re.compile(
 
 
 def bracket_is_name(bracket: str) -> bool:
-    """Heuristic: does this bracket tag contain a person's name (rather than
-    a constituency)?"""
+    """Heuristic: does this tag contain a person's name (rather than a
+    constituency)? Used both for "[bracket]" tag content and, by
+    PLAIN_NAME_RE, for the prefix of a bracket-less "Name: text" line."""
     return bool(NAME_HINT_RE.search(bracket) or BIN_RE.search(bracket))
 
 
@@ -173,8 +188,13 @@ def extract_turns(pages_text: list[str], pdf_label: str) -> list[Turn]:
         stripped = raw_line.strip()
         hm = HEADER_RE.match(stripped)
         cm = None if hm else CHAIR_RE.match(stripped)
+        pm = None
+        if not hm and not cm:
+            cand = PLAIN_NAME_RE.match(stripped)
+            if cand and bracket_is_name(cand.group(1)):
+                pm = cand
 
-        if hm or cm:
+        if hm or cm or pm:
             if current is not None:
                 turns.append(finalize(current))
             if hm:
@@ -192,7 +212,7 @@ def extract_turns(pages_text: list[str], pdf_label: str) -> list[Turn]:
                     "is_minister_style": bracket_is_name(bracket),
                     "speech_lines": [rest] if rest else [],
                 }
-            else:
+            elif cm:
                 _, rest = cm.groups()
                 order += 1
                 current = {
@@ -203,6 +223,19 @@ def extract_turns(pages_text: list[str], pdf_label: str) -> list[Turn]:
                     "prefix_raw": "",
                     "bracket_raw": "Tuan Yang di-Pertua",
                     "is_minister_style": False,
+                    "speech_lines": [rest] if rest else [],
+                }
+            else:
+                name, rest = pm.groups()
+                order += 1
+                current = {
+                    "order": order,
+                    "page_start": page_no,
+                    "page_end": page_no,
+                    "kind": "NAMED",
+                    "prefix_raw": "",
+                    "bracket_raw": name.strip(),
+                    "is_minister_style": True,
                     "speech_lines": [rest] if rest else [],
                 }
         else:
